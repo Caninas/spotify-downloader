@@ -3,6 +3,7 @@ import re
 import signal
 import sys
 import traceback
+import lxml.html
 from argparse import ArgumentParser
 from configparser import ConfigParser
 from datetime import datetime
@@ -110,19 +111,19 @@ class SpotifySong:
         title: str,
         artist: str,
         album: str,
-        id: str,
+        url: str,
         track_number: str = "0",
         cover_art_url: str = "",
-        release_date: str = ""
+        release_date: str = "",
     ):
         self.title = title
         self.artist = artist
         self.album = album
         self.track_number = str(track_number)
-        self.id = id
+        self.url = url
+        self.id = url.split('/')[-1].split('?')[0]
         self.cover_art_url = cover_art_url
         self.release_date = release_date
-        self.url = f"https://open.spotify.com/track/{self.id}"
 
     def __eq__(self, other):
         return self.url == other.url
@@ -173,27 +174,57 @@ class SpotifyPlaylist:
         return self.url == other.url
 
 
-def get_spotify_track(track_id: str, token: str) -> SpotifySong:
-    # GET to playlist URL can get first 30 songs only
-    # soup.find_all('meta', content=re.compile("https://open.spotify.com/track/\w+"))
+def get_spotify_track(url: str, token: str) -> SpotifySong:
+    if (url.find("spotify") != -1):
+        # GET to playlist URL can get first 30 songs only
+        # soup.find_all('meta', content=re.compile("https://open.spotify.com/track/\w+"))
+        
+        track_resp = requests.get(
+            f'https://api.spotify.com/v1/tracks/{url.split('/')[-1].split('?')[0]}',
+            headers={'Authorization': f"Bearer {token}"}
+        )
 
-    track_resp = requests.get(
-        f'https://api.spotify.com/v1/tracks/{track_id}',
-        headers={'Authorization': f"Bearer {token}"}
-    )
+        track = track_resp.json()
 
-    track = track_resp.json()
+        return SpotifySong(
+            title=track['name'],
+            artist=', '.join(artist['name'] for artist in track['artists']),
+            album=track['album']['name'],
+            url=url,
+            track_number=track['track_number'],
+            cover_art_url=track['album']['images'][0]['url'] if len(track['album'].get('images', [])) else None,
+            release_date=track['album']['release_date']
+        )
+    else:
+        encoded_url = requests.utils.quote(url)
 
-    return SpotifySong(
-        title=track['name'],
-        artist=', '.join(artist['name'] for artist in track['artists']),
-        album=track['album']['name'],
-        id=track['id'],
-        track_number=track['track_number'],
-        cover_art_url=track['album']['images'][0]['url'] if len(track['album'].get('images', [])) else None,
-        release_date=track['album']['release_date']
-    )
+        api_info_url = "https://lucida.to/?url=" + encoded_url
 
+        track_resp = requests.get(
+            api_info_url,
+        )
+
+        html = lxml.html.fromstring(track_resp.content)
+
+        # get info from the HTML
+        title = html.find_class("title")[0].text_content().strip()
+        artist = [artist.text_content().strip() for artist in html.find_class("normal")]
+        album = html.find_class("album")[0].text_content().split("from")[1].strip()
+        release_date = album[-6:-1]       # release_date is at the end of album string
+
+        album = album[0:-6]
+        cover_art_url = html.find_class("cover-right")[0].text_content()
+
+        return SpotifySong(
+            title=title,
+            artist=', '.join(artist),
+            album=album,
+            release_date=release_date,
+            url=url,                                    # internally will be split to self.id
+            cover_art_url=cover_art_url,
+        )
+
+    
 
 def get_spotify_album(album_id: str, token: str) -> SpotifyAlbum:
     # GET to playlist URL can get first 30 songs only
@@ -517,8 +548,8 @@ def assemble_str_from_template(
     else:
         _validate_filename_template(template, required)
 
+        # .replace(r"{track_num}", track.track_number) \
     template = template \
-        .replace(r"{track_num}", track.track_number) \
         .replace(r"{title}", track.title) \
         .replace(r"{album}", track.album) \
         .replace(r"{artist}", track.artist)
@@ -753,7 +784,7 @@ def process_input_url(url: str, filename_template: str, interactive: bool, spoti
     track_obj_title_tuples = []
 
     if "/track/" in url:
-        track_obj = get_spotify_track(track_id=url.split('/')[-1].split('?')[0], token=spotify_token)
+        track_obj = get_spotify_track(url=url, token=spotify_token)
 
         if not track_obj:
             print(f"\t[!] Song not found{f' at {url}' if not interactive else ''}.")
@@ -860,7 +891,7 @@ def download_track(
 ):
     if downloader == DOWNLOADER_LUCIDA:
         # This might come back to bite me in the ass. need to infer file type
-        file_ext = file_type.split('-')[0] if file_type != 'original' else "ogg"
+        file_ext = file_type.split('-')[0] if file_type != 'original' else "ogg" if isinstance(track, SpotifySong) else "flac"
     elif downloader == DOWNLOADER_SPOTIFYDOWN:
         file_ext = "mp3"
 
@@ -954,26 +985,29 @@ def download_track(
     with open(dest_dir/track_filename, 'wb') as track_mp3_fp:
         track_mp3_fp.write(audio_dl_resp.content)
 
-    mp3_file = eyed3.load(dest_dir/track_filename)
+    # flac (original) files come without cover art
+    if downloader == DOWNLOADER_SPOTIFYDOWN or file_ext == "flac":
+        mp3_file = eyed3.load(dest_dir/track_filename)
 
-    if not mp3_file.tag:
-        mp3_file.initTag()
+        if not mp3_file.tag:
+            mp3_file.initTag()
 
-    # For cover art
-    if track.cover_art_url:
-        cover_resp = requests.get(track.cover_art_url)
-        mp3_file.tag.images.set(ImageFrame.FRONT_COVER, cover_resp.content, 'image/jpeg')
+        # For cover art
+        if track.cover_art_url:
+            cover_resp = requests.get(track.cover_art_url)
+            mp3_file.tag.images.set(ImageFrame.FRONT_COVER, cover_resp.content, 'image/jpeg')
 
-    mp3_file.tag.album = track.album
+    if downloader == DOWNLOADER_SPOTIFYDOWN: # lucida downloads already came with all the info (can't check right now, offline)
+        mp3_file.tag.album = track.album
 
-    if track.release_date:
-        mp3_file.tag.release_date = track.release_date
+        if track.release_date:
+            mp3_file.tag.release_date = track.release_date
 
-    if track.track_number:
-        mp3_file.tag.track_num = track.track_number
+        if track.track_number:
+            mp3_file.tag.track_num = track.track_number
 
-    # remove version arg if album art not showing up in Serato
-    mp3_file.tag.save(version=ID3_V2_3)
+        # remove version arg if album art not showing up in Serato
+        mp3_file.tag.save(version=ID3_V2_3)
 
     # prevent API throttling
     sleep(0.5)
